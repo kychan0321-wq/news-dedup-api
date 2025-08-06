@@ -19,7 +19,7 @@ class NewsRequest(BaseModel):
 def clean_text(s):
     s = re.sub('<.*?>', ' ', s or '')
     s = re.sub('[^0-9a-zA-Z가-힣 ]+', ' ', s)
-    s = re.sub('\s+', ' ', s)
+    s = re.sub(r'\s+', ' ', s)  # ← 여기 수정 (정규식)
     return s.lower().strip()
 
 keywords = [
@@ -37,7 +37,13 @@ def keyword_score(title, desc, keywords):
         score += desc.count(kw_l)
     return score
 
-model = SentenceTransformer('snunlp/KR-SBERT-V40K-klueNLI-augSTS')
+# 모델 지연 로딩
+model = None
+def get_model():
+    global model
+    if model is None:
+        model = SentenceTransformer('snunlp/KR-SBERT-V40K-klueNLI-augSTS')
+    return model
 
 @app.post("/deduplicate")
 def deduplicate_news(request: NewsRequest):
@@ -49,6 +55,7 @@ def deduplicate_news(request: NewsRequest):
         articles.append({'title': title, 'desc': desc, 'full': full})
 
     sentences = [a['full'] for a in articles]
+    model = get_model()  # ← 지연 로딩
     embeddings = model.encode(sentences, convert_to_numpy=True)
 
     n = len(embeddings)
@@ -82,9 +89,8 @@ def deduplicate_news(request: NewsRequest):
             'title': rep_title,
             'description': summary,
             'score': score,
-            'count': len(idxs)   
+            'count': len(idxs)  # ← 겹치는 기사 수
         })
 
     top_10 = sorted(group_reps, key=lambda x: -x['score'])[:10]
-
     return top_10
