@@ -1,13 +1,21 @@
 from fastapi import FastAPI
 from pydantic import BaseModel
 from typing import List
-from sentence_transformers import SentenceTransformer
 import re
 import numpy as np
 from sklearn.metrics.pairwise import cosine_similarity
 from collections import defaultdict
 
+from sentence_transformers import SentenceTransformer
+import functools
+
 app = FastAPI()
+
+# 모델을 전역에서 미리 불러오지 않고, 요청 시 lazy하게 로딩
+@functools.lru_cache(maxsize=1)
+def get_model():
+    return SentenceTransformer('snunlp/KR-SBERT-V40K-klueNLI-augSTS')
+
 
 class NewsItem(BaseModel):
     title: str
@@ -19,7 +27,7 @@ class NewsRequest(BaseModel):
 def clean_text(s):
     s = re.sub('<.*?>', ' ', s or '')
     s = re.sub('[^0-9a-zA-Z가-힣 ]+', ' ', s)
-    s = re.sub(r'\s+', ' ', s)  # ← 여기 수정 (정규식)
+    s = re.sub('\s+', ' ', s)
     return s.lower().strip()
 
 keywords = [
@@ -37,16 +45,10 @@ def keyword_score(title, desc, keywords):
         score += desc.count(kw_l)
     return score
 
-# 모델 지연 로딩
-model = None
-def get_model():
-    global model
-    if model is None:
-        model = SentenceTransformer('snunlp/KR-SBERT-V40K-klueNLI-augSTS')
-    return model
-
 @app.post("/deduplicate")
 def deduplicate_news(request: NewsRequest):
+    model = get_model()  # 요청이 들어올 때만 모델 로딩
+
     articles = []
     for item in request.items:
         title = clean_text(item.title)
@@ -55,7 +57,6 @@ def deduplicate_news(request: NewsRequest):
         articles.append({'title': title, 'desc': desc, 'full': full})
 
     sentences = [a['full'] for a in articles]
-    model = get_model()  # ← 지연 로딩
     embeddings = model.encode(sentences, convert_to_numpy=True)
 
     n = len(embeddings)
@@ -89,8 +90,9 @@ def deduplicate_news(request: NewsRequest):
             'title': rep_title,
             'description': summary,
             'score': score,
-            'count': len(idxs)  # ← 겹치는 기사 수
+            'count': len(idxs)
         })
 
     top_10 = sorted(group_reps, key=lambda x: -x['score'])[:10]
+
     return top_10
