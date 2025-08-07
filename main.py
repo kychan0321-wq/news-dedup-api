@@ -6,6 +6,7 @@ import re
 
 app = FastAPI()
 
+# ✅ 데이터 구조 정의
 class NewsItem(BaseModel):
     title: str
     description: str
@@ -13,23 +14,20 @@ class NewsItem(BaseModel):
 class NewsRequest(BaseModel):
     items: List[NewsItem]
 
-# 텍스트 전처리 함수
+# ✅ 텍스트 정제 함수
 def clean_text(s):
     s = re.sub('<.*?>', ' ', s or '')
     s = re.sub('[^0-9a-zA-Z가-힣 ]+', ' ', s)
     s = re.sub('\s+', ' ', s)
     return s.lower().strip()
 
-# 공통 단어 수 기반 유사도 계산
-def is_similar(text1, text2, thresh=0.5):
-    words1 = set(text1.split())
-    words2 = set(text2.split())
-    if not words1 or not words2:
-        return False
-    overlap = words1 & words2
-    score = len(overlap) / max(len(words1), len(words2))
-    return score >= thresh
+# ✅ 공통 단어 수 계산
+def common_words(a, b):
+    set_a = set(a.split())
+    set_b = set(b.split())
+    return len(set_a & set_b)
 
+# ✅ 키워드 리스트
 keywords = [
     'ai', '인공지능', '로보틱스', '미래산업', '자율주행',
     'sk네트웍스', 'sk networks', 'sk매직', '피닉스랩', 'LLM',
@@ -37,50 +35,62 @@ keywords = [
     '샘 올트먼', '민팃', '생성형 ai', '삼성'
 ]
 
-# 키워드 포함 개수로 간단한 score 측정
-def keyword_score(text, keywords):
-    return sum(text.count(kw.lower()) for kw in keywords)
+# ✅ 키워드 기반 스코어 계산
+def keyword_score(title, desc, keywords):
+    score = 0
+    for kw in keywords:
+        kw_l = kw.lower()
+        score += 2 * title.count(kw_l)
+        score += desc.count(kw_l)
+    return score
 
+# ✅ API 엔드포인트
 @app.post("/deduplicate")
 def deduplicate_news(request: NewsRequest):
-    raw_articles = []
+    articles = []
     for item in request.items:
         title = clean_text(item.title)
         desc = clean_text(item.description)
-        full = title + ' ' + desc
-        raw_articles.append({'title': title, 'desc': desc, 'full': full})
+        articles.append({'title': title, 'desc': desc})
 
-    # 유사도 기반 그룹핑
-    n = len(raw_articles)
+    n = len(articles)
     group_ids = [-1] * n
     curr_gid = 0
+    min_common = 3  # 공통 단어 3개 이상이면 동일 그룹
 
+    # ✅ 기사 그룹화
     for i in range(n):
         if group_ids[i] == -1:
             group_ids[i] = curr_gid
-            for j in range(i + 1, n):
-                if group_ids[j] == -1:
-                    if is_similar(raw_articles[i]['full'], raw_articles[j]['full']):
-                        group_ids[j] = curr_gid
+            for j in range(i+1, n):
+                if group_ids[j] == -1 and common_words(articles[i]['title'], articles[j]['title']) >= min_common:
+                    group_ids[j] = curr_gid
             curr_gid += 1
 
-    # 그룹별 대표 기사 선정 (중복 수 + 키워드 포함 수 기준)
+    # ✅ 그룹별 대표 기사 선정
     group2indices = defaultdict(list)
     for idx, gid in enumerate(group_ids):
         group2indices[gid].append(idx)
 
     group_reps = []
     for idxs in group2indices.values():
-        best_idx = max(idxs, key=lambda i: keyword_score(raw_articles[i]['full'], keywords))
-        rep = raw_articles[best_idx]
+        scores = [keyword_score(articles[i]['title'], articles[i]['desc'], keywords) for i in idxs]
+        best_idx = idxs[scores.index(max(scores))]
+        rep_title = articles[best_idx]['title']
+        rep_desc = articles[best_idx]['desc']
+        score = max(scores)
+        count = len(idxs)
+        if count > 1:
+            rep_title = f"{rep_title} ({count})"
+        summary = rep_desc if len(rep_desc) <= 80 else rep_desc[:80] + "..."
         group_reps.append({
-            'title': rep['title'],
-            'description': rep['desc'][:80] + ('...' if len(rep['desc']) > 80 else ''),
-            'count': len(idxs),
-            'score': keyword_score(rep['full'], keywords)
+            'title': rep_title,
+            'description': summary,
+            'score': score,
+            'count': count
         })
 
-    # 중요도: 중복 수 * 2 + 키워드 score로 정렬
-    top_10 = sorted(group_reps, key=lambda x: (x['count'] * 2 + x['score']), reverse=True)[:10]
+    # ✅ 중요도 순으로 Top 10 정렬
+    top10 = sorted(group_reps, key=lambda x: (-x['score'], -x['count']))[:10]
 
-    return top_10
+    return top10
