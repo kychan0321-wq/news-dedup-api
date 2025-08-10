@@ -91,6 +91,6 @@ def deduplicate_news(request: NewsRequest):
         })
 
     # ✅ 중요도 순으로 Top 10 정렬
-    top10 = sorted(group_reps, key=lambda x: (x['count'] * 1.5 + x['score']), reverse=True)[:10]
+    top10 = sorted(group_reps, key=lambda x: (x['count'] * 1.6 + x['score']), reverse=True)[:10]
 
     return top10
