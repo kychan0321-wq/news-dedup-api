@@ -12,4 +12,4 @@ services:
       - key: JACCARD
         value: "0.60"
       - key: DESC_WIDTH
-        value: "160"
+        value: "160" 

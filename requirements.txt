@@ -1,3 +1,3 @@
 fastapi==0.112.1
 uvicorn[standard]==0.30.5
-# (선택) pydantic>=2.7.0,<3.0.0
+# (선택) pydantic>=2.7.0,<3.0.0 
