@@ -136,55 +136,37 @@ def rank(payload: Any = Body(...)):
 
     # 중복 판단: 포함관계 or SIM_RATIO or JACCARD
     for i in range(n):
-        ti = ntitles[i]
-        for j in range(i+1, n):
-            tj = ntitles[j]
-            if not ti or not tj:
-                continue
-            if ti in tj or tj in ti:
-                union(i,j); continue
-            if title_sim(ti, tj) >= SIM_RATIO:
-                union(i,j); continue
-            if jaccard(ti, tj) >= JACCARD:
-                union(i,j); continue
+        if group_ids[i] == -1:
+            group_ids[i] = curr_gid
+            for j in range(i+1, n):
+                if group_ids[j] == -1 and common_words(articles[i]['title'], articles[j]['title']) >= min_common:
+                    group_ids[j] = curr_gid
+            curr_gid += 1
 
-    clusters = defaultdict(list)
-    for idx in range(n):
-        clusters[find(idx)].append(idx)
+    # ✅ 그룹별 대표 기사 선정
+    group2indices = defaultdict(list)
+    for idx, gid in enumerate(group_ids):
+        group2indices[gid].append(idx)
 
-    def choose_rep(group):
-        # 1) 키워드 발생 수 최대, 2) 설명 길이, 3) 인덱스 작은 것
-        best, key = None, None
-        for i in group:
-            sc = (kwscore[i], len(items[i].description or ""), -i)
-            if key is None or sc > key:
-                best, key = i, sc
-        return best
-
-    groups = []
-    for _, idxs in clusters.items():
-        rep = choose_rep(idxs)
-        groups.append({
-            "rep": rep,
-            "dup_count": len(idxs),
-            "rep_kw": kwscore[rep],
+    group_reps = []
+    for idxs in group2indices.values():
+        scores = [keyword_score(articles[i]['title'], articles[i]['desc'], keywords) for i in idxs]
+        best_idx = idxs[scores.index(max(scores))]
+        rep_title = articles[best_idx]['title']
+        rep_desc = articles[best_idx]['desc']
+        score = max(scores)
+        count = len(idxs)
+        if count > 1:
+            rep_title = f"{rep_title} ({count})"
+        summary = rep_desc if len(rep_desc) <= 80 else rep_desc[:80] + "..."
+        group_reps.append({
+            'title': rep_title,
+            'description': summary,
+            'score': score,
+            'count': count
         })
 
-    # 정렬: (중복수 desc, 대표 키워드수 desc, 제목 사전순)
-    groups.sort(
-        key=lambda g: (g["dup_count"], g["rep_kw"], norm(items[g["rep"]].title)),
-        reverse=True
-    )
-    top10 = groups[:10]
+    # ✅ 중요도 순으로 Top 10 정렬
+    top10 = sorted(group_reps, key=lambda x: (x['count'] * 1.6 + x['score']), reverse=True)[:10]
 
-    results: List[RankedItem] = []
-    for g in top10:
-        rep = g["rep"]
-        obj = RankedItem(
-            title=f"{clean_title(items[rep].title)} ({g['dup_count']})",
-            description=brief(items[rep].description or "", width=DESC_WIDTH),
-            score=int(g["dup_count"] + g["rep_kw"]),
-            count=int(g["dup_count"]),
-        )
-        results.append(obj)
-    return results
+    return top10
