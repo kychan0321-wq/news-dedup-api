@@ -1,12 +1,12 @@
 # -*- coding: utf-8 -*-
 from fastapi import FastAPI, Body, HTTPException, Query
-from pydantic import BaseModel, Field
+from pydantic import BaseModel
 from typing import List, Optional, Any, Dict
 import re, html, os
 from difflib import SequenceMatcher
 from collections import defaultdict
 
-app = FastAPI(title="News Dedup & TopK API", version="1.3.0")
+app = FastAPI(title="News Dedup & TopK API", version="1.3.1")
 
 # ---- CORS ----
 try:
@@ -120,41 +120,66 @@ class NewsItem(BaseModel):
     originallink: Optional[str] = None
     pubDate: Optional[str] = None
 
-# --------- 유연 파서(핵심 수정) ---------
+# --------- 유연 파서(확장) ---------
 def extract_items(payload: Any) -> List[Dict[str, Any]]:
     """
     허용하는 모든 형태에서 NewsItem dict 배열을 뽑아낸다.
-    - { "items": [ {...}, ... ] }
-    - [ {...}, {...} ]  # 뉴스 아이템 배열 자체
-    - [ { "items": [ {...}, ... ], ... }, { "items": [ ... ] } ]  # ✅ 이번 케이스(네이버/검색 래퍼)
-    - 단일 래퍼 { "lastBuildDate": "...", "items": [ ... ] }
+    지원 형태 예:
+      - { "items": [ {...}, ... ] }
+      - { "array": [ {...}, ... ] }                  # ✅ 새로 추가
+      - { "results": [ {...}, ... ] } / { "data": [...] }
+      - [ {...}, {...} ]                             # 아이템 배열 자체
+      - [ { "items": [ ... ] }, { "items": [ ... ] } ]
+      - [ { "array": [ ... ] }, { "array": [ ... ] } ]  # ✅ 새로 추가
+      - 단일 래퍼 { "lastBuildDate": "...", "items": [ ... ] }
     """
-    # dict + items
-    if isinstance(payload, dict) and isinstance(payload.get("items"), list):
-        return payload["items"]
 
-    # 최상위가 배열
+    candidate_keys = ("items", "array", "results", "data")
+
+    def looks_like_items(lst: Any) -> bool:
+        return (
+            isinstance(lst, list) and
+            len(lst) > 0 and
+            all(isinstance(x, dict) and "title" in x for x in lst)
+        )
+
+    # dict 최상위
+    if isinstance(payload, dict):
+        # 우선순위 키들에서 바로 추출
+        for k in candidate_keys:
+            if looks_like_items(payload.get(k)):
+                return payload[k]
+
+        # 메타 래퍼(네이버 등)
+        if any(k in payload for k in ("lastBuildDate", "display", "total")):
+            for k in candidate_keys:
+                if looks_like_items(payload.get(k)):
+                    return payload[k]
+
+    # list 최상위
     if isinstance(payload, list):
-        # 배열이 곧바로 뉴스 아이템인지 감지
-        if payload and isinstance(payload[0], dict) and "title" in payload[0]:
-            return payload  # 이미 NewsItem 배열
+        # 리스트 자체가 아이템 배열
+        if looks_like_items(payload):
+            return payload
 
-        # 배열 안에 래퍼들이 있고, 각 래퍼에 items 배열이 있는 경우 → 전부 합치기
+        # 래퍼 배열 -> 안의 candidate_keys들을 병합
         merged: List[Dict[str, Any]] = []
         for el in payload:
-            if isinstance(el, dict) and isinstance(el.get("items"), list):
-                merged.extend(el["items"])
+            if isinstance(el, dict):
+                for k in candidate_keys:
+                    v = el.get(k)
+                    if looks_like_items(v):
+                        merged.extend(v)
         if merged:
             return merged
 
-    # 단일 래퍼 (배열이 아니지만 lastBuildDate 등의 메타만 있고 items가 있는 경우)
-    if isinstance(payload, dict) and any(k in payload for k in ("lastBuildDate", "display", "total")):
-        if isinstance(payload.get("items"), list):
-            return payload["items"]
-
+    # 아무것도 못 찾은 경우
     raise HTTPException(
         status_code=400,
-        detail="Invalid payload. Provide {items:[...]} OR an array of items OR an array of wrappers each having items."
+        detail=(
+            "Invalid payload. Provide {items:[...]} or {array:[...]} "
+            "or [ {items:[...]}, ... ] / [ {array:[...]}, ... ] / a plain array of items."
+        )
     )
 
 # --------- 헬스체크 ---------
@@ -239,7 +264,6 @@ def rank(
 
     groups.sort(key=lambda g: (g["dup_count"], g["rep_kw"], ntitles[g["rep"]]), reverse=True)
 
-    # 쿼리파라미터 우선, 없으면 환경변수 TOPK
     take = top_k if top_k is not None else max(1, TOPK)
     top_groups = groups[:max(1, take)]
 
