@@ -1,6 +1,6 @@
 services:
   - type: web
-    name: news-dedup-top10
+    name: news-dedup-topk
     env: python
     plan: free
     region: singapore
@@ -13,8 +13,8 @@ services:
         value: "0.82"
       - key: JACCARD
         value: "0.60"
-      - key: DESC_WIDTH
-        value: "160"
+      - key: TOPK
+        value: "3"            # ✅ 기본 Top 3
       - key: FETCH_BY_LINK
         value: "true"
       - key: MAX_FETCH

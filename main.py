@@ -2,11 +2,11 @@
 from fastapi import FastAPI, Body, HTTPException
 from pydantic import BaseModel, Field
 from typing import List, Optional, Any, Dict
-import re, html, textwrap, os
+import re, html, os
 from difflib import SequenceMatcher
 from collections import defaultdict
 
-app = FastAPI(title="News Dedup & Top10 API", version="1.1.0")
+app = FastAPI(title="News Dedup & TopK API", version="1.2.1")
 
 # ---- CORS (Make, 브라우저 호출 대비) ----
 try:
@@ -22,15 +22,15 @@ except Exception:
     pass
 
 # ---- 구성 파라미터(환경변수로 조절 가능) ----
-SIM_RATIO  = float(os.getenv("SIM_RATIO",  "0.82"))   # 제목 시퀀스 유사도
-JACCARD    = float(os.getenv("JACCARD",    "0.60"))   # 제목 자카드 임계치
-DESC_WIDTH = int(os.getenv("DESC_WIDTH",   "160"))    # 요약 길이
+SIM_RATIO   = float(os.getenv("SIM_RATIO",  "0.82"))  # 제목 시퀀스 유사도 임계
+JACCARD     = float(os.getenv("JACCARD",    "0.60"))  # 제목 자카드 임계
+TOPK        = int(os.getenv("TOPK",         "3"))     # ✅ 기본 상위 3개만 반환
 
-# ---- (링크 본문 확장) 환경변수 ----
-FETCH_BY_LINK = os.getenv("FETCH_BY_LINK", "true").lower() == "true"  # 대표 기사만 링크 본문 시도(기본 on)
-MAX_FETCH     = int(os.getenv("MAX_FETCH", "12"))      # 한 요청에서 본문 가져올 최대 대표 기사 수
+# ---- (링크 본문 lazy fetch: 점수 개선 전용) ----
+FETCH_BY_LINK = os.getenv("FETCH_BY_LINK", "true").lower() == "true"  # 대표 기사만 링크 본문 시도
+MAX_FETCH     = int(os.getenv("MAX_FETCH", "12"))       # 요청당 최대 fetch 수(대표 기준)
 HTTP_TIMEOUT  = float(os.getenv("HTTP_TIMEOUT", "5.0"))
-MAX_BYTES     = int(os.getenv("MAX_BYTES", "800000"))  # HTML 최대 바이트
+MAX_BYTES     = int(os.getenv("MAX_BYTES", "800000"))   # HTML 최대 바이트
 USER_AGENT    = os.getenv("USER_AGENT", "Mozilla/5.0 (compatible; NewsDedupBot/1.0)")
 
 # ---- 키워드 ----
@@ -53,22 +53,16 @@ def norm(s: Optional[str]) -> str:
     s = re.sub(r"\s+", " ", s).strip()
     return s
 
-def clean_title(s: Optional[str]) -> str:
-    return TAG_RE.sub("", html.unescape(s or "")).strip().lower()
-
 def keyword_hits(text: str) -> int:
     t = text.casefold()
     total = 0
     for kw in KWS:
         if re.fullmatch(r"[0-9a-z]+(\s[0-9a-z]+)*", kw):
-            pat = r"\b" + re.escape(kw) + r"\b"  # 영문/스페이스 포함 키워드
+            pat = r"\b" + re.escape(kw) + r"\b"   # 영문/스페이스 키워드 → 단어 경계
         else:
-            pat = re.escape(kw)                  # 한글 키워드
+            pat = re.escape(kw)                    # 한글 키워드 → 포함 매치
         total += len(re.findall(pat, t))
     return total
-
-def brief(desc: str, width: int = DESC_WIDTH) -> str:
-    return textwrap.shorten(norm(desc), width=width, placeholder=" ...")
 
 def title_sim(a: str, b: str) -> float:
     return SequenceMatcher(None, a, b).ratio()
@@ -103,13 +97,12 @@ def fetch_article_text(url: Optional[str]) -> Optional[str]:
 
     try:
         soup = BeautifulSoup(html_text, "html.parser")
-        # 스크립트/스타일/내비 등 제거
         for tag in soup(["script", "style", "noscript", "header", "footer", "nav", "aside"]):
             tag.decompose()
 
-        # 흔한 본문 컨테이너 우선 추출(있으면 사용, 없으면 전체 텍스트)
         candidates = []
-        for sel in ["article", "main", "[role=main]", ".newsct_article", "#dic_area", ".article_body", "#articeBody", "#newsEndContents"]:
+        for sel in ["article", "main", "[role=main]", ".newsct_article", "#dic_area",
+                    ".article_body", "#articeBody", "#newsEndContents"]:
             c = soup.select_one(sel)
             if c:
                 txt = re.sub(r"\s+", " ", c.get_text(separator=" ")).strip()
@@ -120,9 +113,7 @@ def fetch_article_text(url: Optional[str]) -> Optional[str]:
         else:
             text = re.sub(r"\s+", " ", soup.get_text(separator=" ")).strip()
 
-        if len(text) < 50:
-            return None
-        return text
+        return text if len(text) >= 50 else None
     except Exception:
         return None
 
@@ -135,43 +126,36 @@ class NewsItem(BaseModel):
     pubDate: Optional[str] = None
 
 class InputPayload(BaseModel):
-    # 네이버/다수 수집기 형태: {"items":[...]} 를 권장
     items: List[NewsItem] = Field(..., description="뉴스 아이템 배열(권장 50개)")
-
-class RankedItem(BaseModel):
-    title: str
-    description: str
-    score: int
-    count: int
 
 # --------- 헬스체크 ---------
 @app.get("/ping")
 def ping():
-    return {"status":"ok"}
+    return {"status": "ok"}
 
 # --------- 핵심 엔드포인트 ---------
-@app.post("/rank", response_model=List[RankedItem])
+# 응답은 입력과 동일 스키마(NewsItem)로 반환
+@app.post("/rank", response_model=List[NewsItem])
 def rank(payload: Any = Body(...)):
     """
-    요청 바디는 두 형태를 모두 허용:
-    1) { "items": [ {title, description, link?, originallink?, ...}, ... ] }  ← 권장
-    2) [ {title, description, link?, originallink?, ...}, ... ]
+    허용 형식:
+    1) { "items": [ {title, description, link?, originallink?, pubDate?}, ... ] }
+    2) [ {title, description, link?, originallink?, pubDate?}, ... ]
     """
     # 유연 파싱
-    items_raw: List[Dict[str, Any]]
     if isinstance(payload, dict) and "items" in payload:
         items_raw = payload["items"]
     elif isinstance(payload, list):
         items_raw = payload
     else:
-        raise HTTPException(status_code=400, detail="Invalid payload. Provide {items: [...]} or an array of items.")
+        raise HTTPException(status_code=400, detail="Invalid payload. Provide {items:[...]} or an array of items.")
 
     items = [NewsItem(**it) for it in items_raw]
     n = len(items)
     if n == 0:
         return []
 
-    # 1) 전처리 (제목+설명 기반 1차 계산)
+    # 1) 전처리 (제목+description 기반 1차 키워드 점수)
     ntitles = [norm(it.title) for it in items]
     ndescs  = [norm(it.description or "") for it in items]
     fulls   = [f"{ntitles[i]} {ndescs[i]}".strip() for i in range(n)]
@@ -184,30 +168,31 @@ def rank(payload: Any = Body(...)):
             parent[x] = parent[parent[x]]
             x = parent[x]
         return x
-    def union(a,b):
+    def union(a, b):
         ra, rb = find(a), find(b)
         if ra != rb:
             parent[rb] = ra
 
     for i in range(n):
         ti = ntitles[i]
-        for j in range(i+1, n):
+        for j in range(i + 1, n):
             tj = ntitles[j]
             if not ti or not tj:
                 continue
             if ti in tj or tj in ti:
-                union(i,j); continue
+                union(i, j); continue
             if title_sim(ti, tj) >= SIM_RATIO:
-                union(i,j); continue
+                union(i, j); continue
             if jaccard(ti, tj) >= JACCARD:
-                union(i,j); continue
+                union(i, j); continue
 
     clusters = defaultdict(list)
     for idx in range(n):
         clusters[find(idx)].append(idx)
 
+    # 3) 클러스터 대표 선택
     def choose_rep(group):
-        # 1) 키워드 발생 수 최대, 2) 설명 길이, 3) 인덱스 작은 것
+        # 1) 키워드 발생 수 최대, 2) description 길이, 3) 인덱스 작은 것
         best, key = None, None
         for i in group:
             sc = (kwscore[i], len(items[i].description or ""), -i)
@@ -218,17 +203,13 @@ def rank(payload: Any = Body(...)):
     groups = []
     for _, idxs in clusters.items():
         rep = choose_rep(idxs)
-        groups.append({
-            "rep": rep,
-            "dup_count": len(idxs),
-            "rep_kw": kwscore[rep],
-        })
+        groups.append({"rep": rep, "dup_count": len(idxs), "rep_kw": kwscore[rep]})
 
-    # 3) (게으른 수집) 대표 기사에 한해 링크 본문 보강 → rep_kw/요약 갱신
+    # 4) (Lazy fetch) 대표 기사 링크 본문으로 rep_kw 보강(응답 내용은 원본 유지)
     if FETCH_BY_LINK and MAX_FETCH > 0:
         fetched = 0
-        # 우선 임시 정렬로 “누구부터 긁을지” 결정
-        groups.sort(key=lambda g: (g["dup_count"], g["rep_kw"], norm(items[g["rep"]].title)), reverse=True)
+        # fetch 우선순위
+        groups.sort(key=lambda g: (g["dup_count"], g["rep_kw"], ntitles[g["rep"]]), reverse=True)
         for g in groups:
             if fetched >= MAX_FETCH:
                 break
@@ -240,28 +221,12 @@ def rank(payload: Any = Body(...)):
             if not txt:
                 continue
             fetched += 1
-            # (제목 + 본문) 기반으로 대표 키워드 점수 갱신
-            title_norm = ntitles[rep]  # 이미 정규화한 제목 사용
-            full = f"{title_norm} {norm(txt)}".strip()
+            full = f"{ntitles[rep]} {norm(txt)}".strip()
             g["rep_kw"] = keyword_hits(full)
-            # 응답용 요약을 본문 기반으로 덮어쓰기
-            g["_rep_brief_override"] = brief(txt, width=DESC_WIDTH)
 
-    # 4) 최종 정렬: 1순위 중복수, 2순위 키워드수, 3순위 제목
-    groups.sort(
-        key=lambda g: (g["dup_count"], g["rep_kw"], norm(items[g['rep']].title)),
-        reverse=True
-    )
-    top3 = groups[:3]
+    # 5) 최종 정렬: 1) 중복수 desc 2) 키워드수 desc 3) 제목
+    groups.sort(key=lambda g: (g["dup_count"], g["rep_kw"], ntitles[g["rep"]]), reverse=True)
+    top_groups = groups[:max(1, TOPK)]
 
-    # 5) 응답 구성
-    results: List[RankedItem] = []
-    for g in top3:
-        rep = g["rep"]
-        results.append(RankedItem(
-            title=f"{clean_title(items[rep].title)} ({g['dup_count']})",
-            description=g.get("_rep_brief_override", brief(items[rep].description or "", width=DESC_WIDTH)),
-            score=int(g["dup_count"] + g["rep_kw"]),
-            count=int(g["dup_count"]),
-        ))
-    return results
+    # 6) 응답: 대표 기사를 "원본 그대로" 반환 (필드 가공/추가 없음)
+    return [items[g["rep"]] for g in top_groups]
