@@ -1,15 +1,27 @@
 services:
   - type: web
-    name: news-dedup-api
+    name: news-dedup-top10
     env: python
     plan: free
-    buildCommand: ""
-    startCommand: uvicorn main:app --host 0.0.0.0 --port $PORT
-    healthCheckPath: /ping
+    region: singapore
+    buildCommand: "pip install -r requirements.txt"
+    startCommand: "uvicorn main:app --host 0.0.0.0 --port $PORT"
+    healthCheckPath: "/ping"
+    autoDeploy: true
     envVars:
       - key: SIM_RATIO
         value: "0.82"
       - key: JACCARD
         value: "0.60"
       - key: DESC_WIDTH
-        value: "160" 
+        value: "160"
+      - key: FETCH_BY_LINK
+        value: "true"
+      - key: MAX_FETCH
+        value: "12"
+      - key: HTTP_TIMEOUT
+        value: "5.0"
+      - key: MAX_BYTES
+        value: "800000"
+      - key: USER_AGENT
+        value: "Mozilla/5.0 (compatible; NewsDedupBot/1.0)"

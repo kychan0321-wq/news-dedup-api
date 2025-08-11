@@ -1,3 +1,5 @@
-fastapi==0.112.1
-uvicorn[standard]==0.30.5
-# (선택) pydantic>=2.7.0,<3.0.0 
+fastapi==0.115.0
+uvicorn==0.30.6
+pydantic==2.8.2
+requests==2.32.3
+beautifulsoup4==4.12.3
